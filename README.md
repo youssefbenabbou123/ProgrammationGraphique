@@ -4,6 +4,11 @@ Projet de Programmation Graphique 3D réalisé en C++ avec OpenGL.
 
 Il s'agit d'une scène 3D interactive représentant un tronçon isolé de la Route 66 de nuit (avec possibilité de basculer en mode jour). La scène inclut un motel rétro, une station-service, des voitures en circulation avec leurs phares, un feu de camp animé, un terrain avec relief et une ambiance mystérieuse inspirée des légendes urbaines américaines.
 
+**Vidéo démonstrative** : https://drive.google.com/file/d/1wc067MDCPlAqxO1KgxOvWkKhtQypZMh5/view?usp=sharing
+
+**Explication du code** : https://drive.google.com/file/d/1EasQazJkFzdba9fk6yqmXhOzt5ROQmsG/view?usp=drive_link
+
+
 ## Fonctionnalités
 
 - **Moteur de rendu OpenGL** : Shaders personnalisés (Vertex / Fragment) gérant l'éclairage de Phong/Blinn-Phong.
