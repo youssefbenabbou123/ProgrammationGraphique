@@ -1,0 +1,3 @@
+newmtl car_amg_gt
+Kd 1 1 1
+map_Kd ../textures/car_amg_gt.png

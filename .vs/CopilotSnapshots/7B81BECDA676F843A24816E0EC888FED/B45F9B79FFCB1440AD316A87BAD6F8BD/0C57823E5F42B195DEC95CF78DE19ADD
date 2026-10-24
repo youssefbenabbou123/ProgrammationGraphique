@@ -1,0 +1,1047 @@
+﻿//-----------------------------------------------------------------------------
+// PROJET GRAPHIQUE - Station Service Nocturne en Foret
+// "Midnight Fuel" - Gas Station in a Forest at Night
+//
+// Conforme aux cours IOGL :
+//   Directional Light (Lune) + 7 Point Lights + Spotlight (Torche F)
+//   Lampadaires autour de la station + eclairage auvent
+//
+// CONTROLES :
+//   W/S/A/D  : Deplacement camera
+//   Z / X    : Monter / Descendre
+//   Souris   : Regarder
+//   Molette  : Zoom FOV
+//   F        : Torche ON/OFF
+//   E        : Fil de fer
+//   C        : Camera cinematique
+//   N        : Bascule JOUR / NUIT
+//   H        : Vitesse de la camera cinema (x1 / x3)
+//   F11      : Plein ecran
+//   Echap    : Quitter
+//-----------------------------------------------------------------------------
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <cmath>
+#include <map>
+#define GLEW_STATIC
+#include "GL/glew.h"
+#include "GLFW/glfw3.h"
+#include "glm/glm.hpp"
+#include "glm/gtc/matrix_transform.hpp"
+#include "ShaderProgram.h"
+#include "Texture2D.h"
+#include "Camera.hpp"
+#include "Mesh.h"
+#include "trees_generated.inl"
+
+const char* APP_TITLE = "Midnight Fuel - Gas Station in Forest | OpenGL";
+int gWindowWidth  = 1280;
+int gWindowHeight = 720;
+GLFWwindow* gWindow = NULL;
+bool gWireframe       = false;
+bool gFlashlightOn    = true;
+bool gCinematicCamera = true;  // la video demarre des le lancement (C = souris)
+float gCineSpeed      = 1.0f;  // H = x1 / x3 (vitesse de la visite cinema)
+bool gDayMode         = false; // N = bascule jour / nuit
+bool gFullscreen      = false; // F11 = plein ecran
+int  gWindowedX = 100, gWindowedY = 100, gWindowedW = 1280, gWindowedH = 720;
+int  gCampfireFlamesIndex = -1;
+int  gMoonIndex           = -1;
+
+// Voitures en circulation sur la route principale (boucle de bout en bout)
+struct RoadCar {
+    int         objIndex; // index dans gSceneObjects (-1 si non charge)
+    float       x;        // position monde sur l'axe X
+    float       x0;       // position de depart (remise a zero a chaque boucle du cinema)
+    float       z;        // voie (13 = ouest, 19 = est)
+    float       dir;      // +1 = roule vers +X, -1 = roule vers -X
+    float       rotDeg;   // orientation du modele (0 = face -Z)
+    const char* mesh;
+    const char* tex;
+    const char* name;
+};
+const int NUM_ROAD_CARS = 4;
+static_assert(NUM_ROAD_CARS * 2 <= 8, "MAX_HEADLIGHTS du shader = 8 (2 phares par voiture)");
+RoadCar gRoadCars[NUM_ROAD_CARS] = {
+    // --- voie ouest (Z = 13), roule vers -X : spawn tout au bout de la route ---
+    { -1,  180.0f,  180.0f, 13.0f, -1.0f, 270.0f,
+      "models/car_porsche.obj", "textures/car_porsche.png", "Porsche 911 GT3 - Circulation 1" },
+    { -1,  120.0f,  120.0f, 13.0f, -1.0f, 270.0f,
+      "models/car_merc_g.obj",  "textures/car_merc_g.png",  "Mercedes G-Class - Circulation 2" },
+    // --- voie est (Z = 19), roule vers +X : spawn tout au bout de la route ---
+    { -1, -180.0f, -180.0f, 19.0f,  1.0f,  90.0f,
+      "models/car_tesla.obj",  "textures/car_tesla.png",  "Tesla Roadster - Circulation 3" },
+    { -1, -120.0f, -120.0f, 19.0f,  1.0f,  90.0f,
+      "models/car_m3.obj",     "textures/car_m3.png",     "BMW M3 - Circulation 4" }
+};
+const float ROAD_CAR_SPEED = 18.0f; // 65 km/h
+
+// Tour cinema (touche C, active des le lancement) : plan fixe de depart devant le
+// motel, inspection du motel puis de la station, le feu de camp, et zoom sur
+// Slender Man. Chaque point = instant + position + ou la camera regarde.
+// La boucle est fermee : le dernier point est identique au premier.
+struct CamShot {
+    float   t;
+    glm::vec3 pos;
+    glm::vec3 look;
+};
+const CamShot gCamTour[] = {
+    // --- 1. Ouverture : la camera regarde la LUNE, puis la vue descend
+    //         doucement sur la route pendant qu'on avance ---
+    {   0.0f, glm::vec3(175.0f,  8.0f, 17.0f), glm::vec3(-80.0f, 230.0f,-240.0f) }, // face a la lune
+    {   8.0f, glm::vec3(165.0f,  7.5f, 17.0f), glm::vec3(-40.0f, 120.0f,-140.0f) }, // la vue redescend
+    {  14.0f, glm::vec3(155.0f,  6.5f, 17.0f), glm::vec3( 90.0f,   6.0f,  10.0f) }, // on regarde la route
+    // --- 2. On approche du motel, puis inspection depuis l'exterieur (2s plus courte) ---
+    {  22.0f, glm::vec3(140.0f,  6.0f, 16.0f), glm::vec3(120.0f,   4.5f,   0.0f) },
+    {  30.0f, glm::vec3(126.0f,  6.0f, 14.5f), glm::vec3(110.0f,   4.5f,  -8.0f) },
+    {  36.0f, glm::vec3(108.0f,  6.5f, 13.5f), glm::vec3(100.0f,   4.0f, -12.0f) }, // balayage facade
+    {  42.0f, glm::vec3( 98.0f,  6.5f, 16.0f), glm::vec3(105.0f,   4.5f,  -8.0f) },
+    {  48.0f, glm::vec3(105.0f,  7.5f, 22.0f), glm::vec3(110.0f,   5.0f,  -2.0f) }, // motel + enseigne
+    // --- 3. On reprend la route vers l'ouest, direction la station ---
+    {  56.0f, glm::vec3( 70.0f,  6.5f, 17.0f), glm::vec3( 10.0f,   3.0f,   0.0f) },
+    {  62.0f, glm::vec3( 30.0f,  6.5f, 16.0f), glm::vec3(  0.0f,   3.0f,  -4.0f) },
+    // --- 4. Inspection de la station-service ---
+    {  68.0f, glm::vec3( 16.0f,  6.0f, 14.0f), glm::vec3(  0.0f,   3.0f,  -2.0f) },
+    {  74.0f, glm::vec3(  0.0f,  5.0f, 13.0f), glm::vec3(  0.0f,   2.5f,  -3.0f) },
+    {  80.0f, glm::vec3(-16.0f,  6.0f, 13.0f), glm::vec3( -2.0f,   2.5f,  -4.0f) },
+    {  86.0f, glm::vec3(-26.0f,  8.0f,  8.0f), glm::vec3(  0.0f,   3.0f,  -8.0f) },
+    // --- 5. Vol vers le campement, inspection du feu de camp ---
+    {  94.0f, glm::vec3(-30.0f, 11.0f, 20.0f), glm::vec3(-35.0f,   2.0f,  46.0f) },
+    { 102.0f, glm::vec3(-32.0f,  7.0f, 38.0f), glm::vec3(-35.0f,   1.2f,  46.0f) },
+    { 108.0f, glm::vec3(-35.0f,  3.6f, 41.0f), glm::vec3(-35.0f,   1.0f,  47.0f) },
+    // --- 6. Zoom avant vers Slender Man (par la gauche, cadres sur lui) ---
+    //     le point "on tient le plan" empeche la courbe d'etre tiree vers la droite
+    { 114.0f, glm::vec3(-36.5f,  3.6f, 47.0f), glm::vec3(-35.0f,   1.8f,  58.0f) },
+    { 119.0f, glm::vec3(-37.0f,  3.3f, 52.0f), glm::vec3(-34.3f,   2.0f,  62.5f) },
+    { 125.0f, glm::vec3(-36.6f,  3.0f, 56.5f), glm::vec3(-34.0f,   2.1f,  62.5f) },
+    { 133.0f, glm::vec3(-36.6f,  3.0f, 57.3f), glm::vec3(-34.0f,   2.1f,  62.5f) }, // on tient le plan
+    // --- 7. Retour rapide en altitude jusqu'au point de depart (face a la lune) ---
+    { 141.0f, glm::vec3(-10.0f, 16.0f, 30.0f), glm::vec3( 40.0f,   5.0f,  14.0f) },
+    { 149.0f, glm::vec3(110.0f, 12.0f, 24.0f), glm::vec3(150.0f,   6.0f,  10.0f) },
+    { 157.0f, glm::vec3(175.0f,  8.0f, 17.0f), glm::vec3(-80.0f, 230.0f,-240.0f) }  // boucle
+};
+const int gNumCamTour = (int)(sizeof(gCamTour) / sizeof(gCamTour[0]));
+
+// Ciel : nuit forestiere par defaut, bascule jour/nuit avec la touche N
+const glm::vec4 CLEAR_NIGHT(0.02f, 0.04f, 0.09f, 1.0f);
+const glm::vec4 CLEAR_DAY  (0.43f, 0.62f, 0.86f, 1.0f);
+glm::vec4 gClearColor = CLEAR_NIGHT;
+
+// Camera : sur le bord de la route, vue d'ensemble sur la station et les voitures
+FPSCamera fpsCamera(glm::vec3(0.0f, 3.2f, 30.0f));
+const double ZOOM_SENSITIVITY  = -3.0;
+const float  MOVE_SPEED        = 20.0f;
+const float  MOUSE_SENSITIVITY = 0.15f;
+
+void glfw_onKey(GLFWwindow* w, int key, int sc, int action, int mode);
+void glfw_onFramebufferSize(GLFWwindow* w, int width, int height);
+void glfw_onMouseScroll(GLFWwindow* w, double dx, double dy);
+void update(double dt);
+void showFPS(GLFWwindow* w);
+bool initOpenGL();
+
+struct SceneObject {
+    std::string name;
+    Mesh*       pMesh;
+    Texture2D*  pTexture;
+    glm::vec3   position;
+    glm::vec3   scale;
+    float       rotationAngleDeg;
+    glm::vec3   rotationAxis;
+    bool        isLoaded;
+    int         alphaTest;
+    int         isEmissive;
+};
+
+const int MAX_SCENE_OBJECTS = 500;
+SceneObject gSceneObjects[MAX_SCENE_OBJECTS];
+int gNumSceneObjects = 0;
+
+std::map<std::string, Mesh*> gMeshCache;
+std::map<std::string, Texture2D*> gTextureCache;
+
+void addObject(const std::string& name,
+               const std::string& objPath,
+               const std::string& texPath,
+               glm::vec3 pos, glm::vec3 scale,
+               float rotAngle = 0.0f,
+               glm::vec3 rotAxis = glm::vec3(0.0f, 1.0f, 0.0f),
+               int alphaTest = 0,
+               int isEmissive = 0)
+{
+    if (gNumSceneObjects >= MAX_SCENE_OBJECTS) return;
+    SceneObject& obj = gSceneObjects[gNumSceneObjects++];
+    obj.name             = name;
+    obj.position         = pos;
+    obj.scale            = scale;
+    obj.rotationAngleDeg = rotAngle;
+    obj.rotationAxis     = rotAxis;
+    obj.alphaTest        = alphaTest;
+    obj.isEmissive       = isEmissive;
+    obj.isLoaded         = false;
+    obj.pMesh            = nullptr;
+    obj.pTexture         = nullptr;
+
+    auto itMesh = gMeshCache.find(objPath);
+    if (itMesh != gMeshCache.end()) {
+        obj.pMesh = itMesh->second;
+    } else {
+        std::cout << "[Load Mesh] " << objPath << " ... " << std::flush;
+        Mesh* m = new Mesh();
+        if (m->loadOBJ(objPath)) {
+            gMeshCache[objPath] = m;
+            obj.pMesh = m;
+        } else {
+            delete m;
+            std::cout << "SKIP" << std::endl;
+        }
+    }
+
+    if (obj.pMesh) {
+        auto itTex = gTextureCache.find(texPath);
+        if (itTex != gTextureCache.end()) {
+            obj.pTexture = itTex->second;
+        } else {
+            Texture2D* t = new Texture2D();
+            t->loadTexture(texPath, true);
+            gTextureCache[texPath] = t;
+            obj.pTexture = t;
+        }
+        obj.isLoaded = true;
+    }
+}
+
+int main()
+{
+    if (!initOpenGL()) { std::cerr << "Erreur init OpenGL." << std::endl; return -1; }
+
+    ShaderProgram lightingShader;
+    lightingShader.loadShaders("shaders/lighting_dir_point_spot.vert",
+                               "shaders/lighting_dir_point_spot.frag");
+    ShaderProgram bulbShader;
+    bulbShader.loadShaders("shaders/bulb.vert", "shaders/bulb.frag");
+    Mesh bulbMesh;
+    bulbMesh.loadOBJ("models/light.obj");
+
+    // =========================================================================
+    // 1. SOL & TERRAIN (Herbe luxuriante d'apres grass.avif)
+    // Terrain d'un seul bloc sans coutures : 280m x 200m a y=0.00
+    // =========================================================================
+    addObject("Terrain Herbe",
+              "models/grass_ground.obj", "textures/grass.jpg",
+              glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f));
+
+    // Esplanade asphaltee de la station (devant et sous la station, 56m x 45m)
+    // y = 0.01 (legerement au-dessus de l'herbe pour zero z-fighting)
+    addObject("Sol Station",
+              "models/station_ground.obj", "textures/asphalt.jpg",
+              glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(1.0f, 1.0f, 1.0f));
+
+    // Route droite propre avec bordures 3D et marquages au sol (Axe X, Z=16m, L=240m, l=12m)
+    // y = 0.03 avec bordures biseautees vers le sol
+    addObject("Route Principale",
+              "models/road.obj", "textures/road_clean.jpg",
+              glm::vec3(0.0f, 0.0f, 16.0f), glm::vec3(1.0f, 1.0f, 1.0f));
+
+    // =========================================================================
+    // 2. STATION SERVICE PRINCIPALE (Tournee a 180° pour faire face a la route)
+    // Dimensions reelles : 44.5m x 13.8m x 34.0m, auvent et pompes vers +Z
+    // =========================================================================
+    addObject("Gas Station",
+              "models/gas_station.obj", "textures/gas_station.png",
+              glm::vec3(0.0f, 0.0f, -10.0f),
+              glm::vec3(1.0f, 1.0f, 1.0f),
+              180.0f);
+
+    // =========================================================================
+    // 3. VOITURES (5 modeles distincts, echelle 1.0 = taille reelle, roues au sol)
+    // =========================================================================
+    float carScale = 1.0f;
+    float carY     = 0.03f; // roues au niveau de l'asphalte
+
+    // -------------------------------------------------------------------------
+    // COMMENT CHANGER LA POSITION ET L'ORIENTATION DES VOITURES :
+    //   glm::vec3(X, Y, Z) :
+    //     X : Deplacement Gauche (-) / Droite (+)
+    //     Y : Hauteur (laisser 0.03f pour que les roues touchent le sol)
+    //     Z : Deplacement Avant / Arriere le long des pompes (-Z vers le fond, +Z vers la route)
+    //   Dernier parametre (Angle de rotation en degres) :
+    //     180.0f = VERTICALE (Face a la boutique / entre dans la station)
+    //       0.0f = VERTICALE (Face a la route / sort de la station)
+    //      90.0f = HORIZONTALE (Face vers la droite / motel)
+    //     270.0f = HORIZONTALE (Face vers la gauche / route)
+    // -------------------------------------------------------------------------
+
+    // Voiture 1 - Pompe de Gauche sous l'auvent (Nissan GT-R Nismo)
+    addObject("Nissan GT-R - Pompe Gauche",
+              "models/car_gtr.obj", "textures/car_gtr.png",
+              glm::vec3(-0.2f, carY, -4.3f),
+              glm::vec3(carScale, carScale, carScale),
+              90.0f);
+
+    // Voiture 2 - Pompe de Droite sous l'auvent (Mercedes-AMG GT S)
+    addObject("Mercedes-AMG GT - Pompe Droite",
+              "models/car_amg_gt.obj", "textures/car_amg_gt.png",
+              glm::vec3(-0.1f, carY, -0.2f),
+              glm::vec3(carScale, carScale, carScale),
+              270.0f);
+
+    // Voitures circulantes - CIRCULATION : 4 modeles en boucle sur la route principale
+    //   Voie est (Z = 19) vers +X / voie ouest (Z = 13) vers -X, phares allumes
+    for (int c = 0; c < NUM_ROAD_CARS; c++) {
+        gRoadCars[c].objIndex = gNumSceneObjects;
+        addObject(gRoadCars[c].name,
+                  gRoadCars[c].mesh, gRoadCars[c].tex,
+                  glm::vec3(gRoadCars[c].x, carY, gRoadCars[c].z),
+                  glm::vec3(carScale, carScale, carScale),
+                  gRoadCars[c].rotDeg);
+    }
+
+    // =========================================================================
+    // 4. FORET REALISTE DENSE (realistic-tree-model, 294 arbres sur 3 cotes et face)
+    // =========================================================================
+    for (int i = 0; i < sNumForestTrees; i++) {
+        addObject("Arbre Foret " + std::to_string(i),
+                  "models/tree.obj", "textures/tree_diffuse.png",
+                  glm::vec3(sForestTrees[i].x, 0.0f, sForestTrees[i].z),
+                  glm::vec3(sForestTrees[i].scale),
+                  sForestTrees[i].rot,
+                  glm::vec3(0.0f, 1.0f, 0.0f),
+                  1);
+    }
+
+    // Foret dense derriere Slender Man (fond du plan de zoom)
+    for (int i = 0; i < sNumExtraTreesSlender; i++) {
+        addObject("Arbre Slender " + std::to_string(i),
+                  "models/tree.obj", "textures/tree_diffuse.png",
+                  glm::vec3(sExtraTreesSlender[i].x, 0.0f, sExtraTreesSlender[i].z),
+                  glm::vec3(sExtraTreesSlender[i].scale),
+                  sExtraTreesSlender[i].rot,
+                  glm::vec3(0.0f, 1.0f, 0.0f),
+                  1);
+    }
+
+    // =========================================================================
+    // 5. LAMPADAIRES (Hauteur 4.22m, echelle 1.0)
+    // =========================================================================
+    // Lampadaires Station Service
+    addObject("Lampadaire Entree Gauche",
+              "models/lampPost.obj", "textures/lamp_post_diffuse.png",
+              glm::vec3(-24.0f, 0.0f, 8.0f), glm::vec3(1.0f));
+    addObject("Lampadaire Entree Droit",
+              "models/lampPost.obj", "textures/lamp_post_diffuse.png",
+              glm::vec3(24.0f, 0.0f, 8.0f), glm::vec3(1.0f));
+    addObject("Lampadaire Arriere Gauche",
+              "models/lampPost.obj", "textures/lamp_post_diffuse.png",
+              glm::vec3(-24.0f, 0.0f, -30.0f), glm::vec3(1.0f));
+    addObject("Lampadaire Arriere Droit",
+              "models/lampPost.obj", "textures/lamp_post_diffuse.png",
+              glm::vec3(24.0f, 0.0f, -30.0f), glm::vec3(1.0f));
+    addObject("Lampadaire Central",
+              "models/lampPost.obj", "textures/lamp_post_diffuse.png",
+              glm::vec3(0.0f, 0.0f, 8.0f), glm::vec3(1.0f));
+
+    // Lampadaires tout le long de la route (480m) - Côté Sud (Z=23.5m)
+    float roadLampsSouthX[] = { -220.0f, -180.0f, -140.0f, -100.0f, -60.0f, -20.0f,
+                                 20.0f,  60.0f,  100.0f,  140.0f,  180.0f,  220.0f };
+    for (float rx : roadLampsSouthX) {
+        addObject("Lampadaire Route Sud " + std::to_string((int)rx),
+                  "models/lampPost.obj", "textures/lamp_post_diffuse.png",
+                  glm::vec3(rx, 0.0f, 23.5f), glm::vec3(1.0f));
+    }
+
+    // Lampadaires tout le long de la route (480m) - Côté Nord (Z=8.5m, alternés)
+    float roadLampsNorthX[] = { -200.0f, -140.0f, -80.0f, -45.0f, 45.0f, 80.0f, 140.0f, 200.0f };
+    for (float rx : roadLampsNorthX) {
+        addObject("Lampadaire Route Nord " + std::to_string((int)rx),
+                  "models/lampPost.obj", "textures/lamp_post_diffuse.png",
+                  glm::vec3(rx, 0.0f, 8.5f), glm::vec3(1.0f));
+    }
+
+    // Lampadaires dédiés au Motel (parking et entrée)
+    addObject("Lampadaire Motel Entree Gauche",
+              "models/lampPost.obj", "textures/lamp_post_diffuse.png",
+              glm::vec3(85.0f, 0.0f, 9.0f), glm::vec3(1.0f));
+    addObject("Lampadaire Motel Entree Droit",
+              "models/lampPost.obj", "textures/lamp_post_diffuse.png",
+              glm::vec3(135.0f, 0.0f, 9.0f), glm::vec3(1.0f));
+    addObject("Lampadaire Motel Cour",
+              "models/lampPost.obj", "textures/lamp_post_diffuse.png",
+              glm::vec3(110.0f, 0.0f, -2.0f), glm::vec3(1.0f));
+
+    // =========================================================================
+    // 6. BARILS ET CAISSES (Echelle realiste)
+    // =========================================================================
+    addObject("Baril 1",
+              "models/barrel.obj", "textures/barrel_diffuse.png",
+              glm::vec3(-20.0f, 0.0f, -22.0f), glm::vec3(0.35f));
+    addObject("Baril 2",
+              "models/barrel.obj", "textures/barrel_diffuse.png",
+              glm::vec3(-21.2f, 0.0f, -22.0f), glm::vec3(0.35f));
+    addObject("Baril 3",
+              "models/barrel.obj", "textures/barrel_diffuse.png",
+              glm::vec3(-20.0f, 0.0f, -23.2f), glm::vec3(0.35f), 45.0f);
+
+    addObject("Caisse 1",
+              "models/woodcrate.obj", "textures/woodcrate_diffuse.jpg",
+              glm::vec3(20.0f, 0.0f, -22.0f), glm::vec3(0.55f), 15.0f);
+    addObject("Caisse 2",
+              "models/woodcrate.obj", "textures/woodcrate_diffuse.jpg",
+              glm::vec3(21.4f, 0.0f, -22.0f), glm::vec3(0.55f), -20.0f);
+    addObject("Caisse 3",
+              "models/woodcrate.obj", "textures/woodcrate_diffuse.jpg",
+              glm::vec3(20.0f, 1.1f, -22.0f), glm::vec3(0.55f), 30.0f);
+
+    // =========================================================================
+    // 7. CHAINE DE MONTAGNES LOW-POLY AU FOND DU MONDE (3 montagnes massives)
+    // =========================================================================
+    // Montagne Centrale (Grand Sommet au centre, horizon Nord)
+    addObject("Montagne Centrale",
+              "models/mountain.obj", "textures/mountain.jpg",
+              glm::vec3(0.0f, -2.0f, -105.0f),
+              glm::vec3(260.0f, 135.0f, 75.0f),
+              0.0f);
+
+    // Montagne Gauche (Flanc Ouest, relief varie)
+    addObject("Montagne Gauche",
+              "models/mountain.obj", "textures/mountain.jpg",
+              glm::vec3(-150.0f, -3.0f, -112.0f),
+              glm::vec3(240.0f, 118.0f, 70.0f),
+              0.0f);
+
+    // Montagne Droite (Flanc Est, barriere naturelle)
+    addObject("Montagne Droite",
+              "models/mountain.obj", "textures/mountain.jpg",
+              glm::vec3(150.0f, -3.0f, -115.0f),
+              glm::vec3(250.0f, 122.0f, 72.0f),
+              0.0f);
+
+    // -------------------------------------------------------------------------
+    // 7c. CHAINE DE MONTAGNES AU SUD (derriere la foret, face a la scene)
+    //     tournee a 180 deg pour que la pente regarde la station
+    // -------------------------------------------------------------------------
+    addObject("Montagne Sud Centrale",
+              "models/mountain.obj", "textures/mountain.jpg",
+              glm::vec3(0.0f, -2.0f, 110.0f),
+              glm::vec3(260.0f, 130.0f, 75.0f),
+              180.0f);
+
+    addObject("Montagne Sud Ouest",
+              "models/mountain.obj", "textures/mountain.jpg",
+              glm::vec3(-170.0f, -3.0f, 118.0f),
+              glm::vec3(235.0f, 110.0f, 70.0f),
+              180.0f);
+
+    addObject("Montagne Sud Est",
+              "models/mountain.obj", "textures/mountain.jpg",
+              glm::vec3(160.0f, -3.0f, 115.0f),
+              glm::vec3(250.0f, 120.0f, 72.0f),
+              180.0f);
+
+    // =========================================================================
+    // 7b. LUNE LUMINEUSE DANS LE CIEL NOCTURNE (Texturee et auto-eclairante)
+    // =========================================================================
+    addObject("Lune",
+              "models/Moon.obj", "textures/Moon.png",
+              glm::vec3(-80.0f, 230.0f, -240.0f),
+              glm::vec3(0.65f, 0.65f, 0.65f),
+              0.0f, glm::vec3(0.0f, 1.0f, 0.0f),
+              0, 1); // isEmissive = 1
+    gMoonIndex = gNumSceneObjects - 1; // masquee en mode jour
+
+    // =========================================================================
+    // 8. CAMPEMENT GUERRIER ISOLE DANS LA FORET (Derriere 2 rangees d'arbres)
+    // Emplacement clairiere abritee (X = -35m, Z = 46m)
+    // =========================================================================
+    glm::vec3 campPos(-35.0f, 0.0f, 46.0f);
+
+    // 8a. Grande Tente Tribale (Au fond de la clairiere derriere le guerrier)
+    addObject("Tribal Tent",
+              "models/tent.obj", "textures/tent.jpg",
+              glm::vec3(-35.0f, 0.0f, 51.0f), glm::vec3(1.0f),
+              0.0f, glm::vec3(0.0f, 1.0f, 0.0f), 0);
+
+    // 8b. Base du feu de camp (pierres au sol, bois, braises - a l'endroit)
+    addObject("Campfire Base",
+              "models/campfire_base.obj", "textures/campfire_base.jpg",
+              campPos, glm::vec3(1.1f), 0.0f, glm::vec3(0.0f, 1.0f, 0.0f), 0);
+
+    // 8c. Flammes du feu de camp (animees en temps reel avec test alpha)
+    gCampfireFlamesIndex = gNumSceneObjects;
+    addObject("Campfire Flames",
+              "models/campfire_fire.obj", "textures/campfire_fire.png",
+              campPos, glm::vec3(1.1f), 0.0f, glm::vec3(0.0f, 1.0f, 0.0f), 1);
+
+    // 8d. Feu de camp avec trepied et marmite de cuisson (Downloads Campfire)
+    addObject("Campfire Cooking Pot",
+              "models/campfire_pot.obj", "textures/campfire_pot.png",
+              glm::vec3(-31.8f, 0.0f, 46.5f), glm::vec3(0.9f),
+              25.0f, glm::vec3(0.0f, 1.0f, 0.0f), 0);
+
+    // 8e. Buche de bois servant de banc
+    addObject("Log Bench",
+              "models/log.obj", "textures/log.jpg",
+              glm::vec3(-35.0f, 0.0f, 48.2f), glm::vec3(0.55f, 0.48f, 0.48f),
+              90.0f, glm::vec3(0.0f, 1.0f, 0.0f), 0);
+
+    // 8f. Guerrier debout devant sa buche, face au feu
+    addObject("Warrior",
+              "models/warrior.obj", "textures/warrior.png",
+              glm::vec3(-35.0f, 0.0f, 47.4f), glm::vec3(1.0f),
+              180.0f, glm::vec3(0.0f, 1.0f, 0.0f), 0);
+
+    // =========================================================================
+    // 9. MOTEL RETRO COMPLET & PARKING ASPHALTE
+    // Situe le long de la route a X = 110m, tourne face a la route (270 deg)
+    // =========================================================================
+    // Dalle d'asphalte du parking reliant le motel a la route
+    addObject("Motel Parking Asphalte",
+              "models/motel_ground.obj", "textures/asphalt.jpg",
+              glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(1.0f));
+
+    // Batiment du Motel (agrandi a 1.75x et oriente face a la route)
+    addObject("Motel",
+              "models/motel.obj", "textures/motel.jpg",
+              glm::vec3(110.0f, 0.0f, -15.0f),
+              glm::vec3(1.75f, 1.75f, 1.75f),
+              270.0f, glm::vec3(0.0f, 1.0f, 0.0f), 0);
+
+    // Grand panneau MOTEL "Route 66" (7 m de haut) juste devant la cloture,
+    // face a la route (180 deg = cote lisible vers +Z), eclaire par le point light 25
+    //
+    // >>> POUR DEPLACER L'ENSEIGNE : changer SIGN_POS ci-dessous <<<
+    // Tout suit automatiquement : le panneau, son projecteur et son bulbe.
+    //   X = gauche/droite, Y = sol, Z = avant/arriere (la route est vers +Z)
+    const glm::vec3 SIGN_POS(90.0f, 0.02f, 8.8f);
+    const glm::vec3 SIGN_LIGHT_POS = SIGN_POS + glm::vec3(0.0f, 7.58f, 0.6f); // au-dessus, cote route
+
+    // Grand panneau MOTEL "Route 66" (7 m de haut) juste devant la cloture,
+    // face a la route (180 deg = cote lisible vers +Z), eclaire par le point light 25
+    addObject("Enseigne Motel Route 66",
+              "models/sign_route66.obj", "textures/sign_route66.png",
+              SIGN_POS,
+              glm::vec3(1.0f),                  // <-- taille : 1.0 = 7 m de haut
+              180.0f, glm::vec3(0.0f, 1.0f, 0.0f), 0); // <-- 180 = face a la route
+
+    // Panneau routier "DOWNTOWN / Battle Creek - Exit 40 MPH" (4.2 m de haut)
+    // pose sur le pelouse du motel, oriente 90 deg = le cote lisible regarde +X
+    // (les voitures qui arrivent de l'est et la camera le lisent face)
+    //
+    // >>> POUR DEPLACER CE PANNEAU : changer SIGN2_POS ci-dessous <<<
+    const glm::vec3 SIGN2_POS(125.0f, 0.0f, 6.5f); // X = gauche/droite, Y = sol, Z = avant/arriere
+    addObject("Panneau Routier DOWNTOWN",
+              "models/sign_road.obj", "textures/sign_road.png",
+              SIGN2_POS,
+              glm::vec3(1.0f),                  // <-- taille : 1.0 = 4.2 m de haut
+              90.0f, glm::vec3(0.0f, 1.0f, 0.0f), 0); // <-- 90 = face aux voitures qui viennent de l'est
+
+    // =========================================================================
+    // 10. CLOTURES & ENCEINTES (Station-service et Motel)
+    // =========================================================================
+    // Cloture metallique grillagee (chain-link) ceinturant toute la station-service
+    addObject("Cloture Station Service",
+              "models/gas_station_fence.obj", "textures/fence.jpg",
+              glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(1.0f));
+
+    // Haie vegetale verte delimitant tout le pourtour du motel
+    addObject("Haie Vegetale Motel",
+              "models/motel_hedge.obj", "textures/hedge.jpg",
+              glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(1.0f));
+
+    // =========================================================================
+    // 10b. PANNEAUX DE SIGNALISATION (Limitation de vitesse 80-110 km/h)
+    // =========================================================================
+    addObject("Panneau Vitesse Ouest",
+              "models/speed_sign.obj", "textures/speed_sign.png",
+              glm::vec3(-50.0f, 0.03f, 22.8f),
+              glm::vec3(0.75f),
+              90.0f);
+    addObject("Panneau Vitesse Est",
+              "models/speed_sign.obj", "textures/speed_sign.png",
+              glm::vec3(65.0f, 0.03f, 22.8f),
+              glm::vec3(0.75f),
+              90.0f);
+
+    // =========================================================================
+    // 11. SLENDER MAN - Penombre au fond du campement (~3.2m de haut)
+    // Place plus loin dans la foret derriere la tente, retourne face au joueur
+    // =========================================================================
+    addObject("Slender Man",
+               "models/slenderman.obj", "textures/slenderman.jpg",
+               glm::vec3(-34.0f, 0.0f, 62.5f),
+               glm::vec3(3.2f, 3.2f, 3.2f),
+               0.0f, glm::vec3(0.0f, 1.0f, 0.0f), 0);
+
+    // =========================================================================
+    // CONFIGURATION DES 26 POINT LIGHTS (Station, Motel, Route, Feu de camp, Slenderman, Enseigne)
+    // =========================================================================
+    struct PointLightConfig {
+        glm::vec3 position;
+        glm::vec3 ambient;
+        glm::vec3 diffuse;
+        glm::vec3 specular;
+        float constant;
+        float linear;
+        float exponent;
+    };
+
+    const int NUM_POINT_LIGHTS = 26;
+    PointLightConfig pointLights[NUM_POINT_LIGHTS] = {
+        // --- 0 a 6 : STATION-SERVICE (Sodium ambre chaud et doux) ---
+        // 0: Lampadaire Entree Gauche
+        { glm::vec3(-24.0f, 4.2f,   8.0f), glm::vec3(0.02f, 0.015f, 0.005f), glm::vec3(0.85f, 0.65f, 0.30f), glm::vec3(0.5f, 0.4f, 0.2f), 1.0f, 0.08f, 0.025f },
+        // 1: Lampadaire Entree Droit
+        { glm::vec3( 24.0f, 4.2f,   8.0f), glm::vec3(0.02f, 0.015f, 0.005f), glm::vec3(0.85f, 0.65f, 0.30f), glm::vec3(0.5f, 0.4f, 0.2f), 1.0f, 0.08f, 0.025f },
+        // 2: Auvent Pompe Gauche (eclaire la BMW 1 sous la pompe)
+        { glm::vec3( -4.2f, 4.6f,  -2.3f), glm::vec3(0.03f, 0.03f, 0.025f), glm::vec3(1.15f, 1.10f, 0.95f), glm::vec3(0.7f, 0.7f, 0.6f), 1.0f, 0.07f, 0.020f },
+        // 3: Auvent Pompe Droite (eclaire la BMW 2 sous la pompe)
+        { glm::vec3(  3.4f, 4.6f,  -2.3f), glm::vec3(0.03f, 0.03f, 0.025f), glm::vec3(1.15f, 1.10f, 0.95f), glm::vec3(0.7f, 0.7f, 0.6f), 1.0f, 0.07f, 0.020f },
+        // 4: Lampadaire Central Entree
+        { glm::vec3(  0.0f, 4.2f,   8.0f), glm::vec3(0.02f, 0.015f, 0.005f), glm::vec3(0.85f, 0.65f, 0.30f), glm::vec3(0.5f, 0.4f, 0.2f), 1.0f, 0.08f, 0.025f },
+        // 5: Lampadaire Arriere Gauche
+        { glm::vec3(-24.0f, 4.2f, -30.0f), glm::vec3(0.02f, 0.015f, 0.005f), glm::vec3(0.80f, 0.60f, 0.28f), glm::vec3(0.4f, 0.3f, 0.2f), 1.0f, 0.08f, 0.025f },
+        // 6: Lampadaire Arriere Droit
+        { glm::vec3( 24.0f, 4.2f, -30.0f), glm::vec3(0.02f, 0.015f, 0.005f), glm::vec3(0.80f, 0.60f, 0.28f), glm::vec3(0.4f, 0.3f, 0.2f), 1.0f, 0.08f, 0.025f },
+        // 7: Vitrine & Devanture Station
+        { glm::vec3(  0.0f, 4.0f, -13.0f), glm::vec3(0.025f, 0.025f, 0.03f), glm::vec3(0.95f, 0.90f, 0.95f), glm::vec3(0.5f, 0.5f, 0.5f), 1.0f, 0.08f, 0.025f },
+
+        // --- 8 a 14 : MOTEL (Illumination agreable et ciblee) ---
+        // 8: Lampadaire Motel Entree Gauche
+        { glm::vec3( 85.0f, 4.2f,   9.0f), glm::vec3(0.02f, 0.018f, 0.01f), glm::vec3(0.85f, 0.70f, 0.40f), glm::vec3(0.4f, 0.4f, 0.2f), 1.0f, 0.08f, 0.025f },
+        // 9: Lampadaire Motel Entree Droit
+        { glm::vec3(135.0f, 4.2f,   9.0f), glm::vec3(0.02f, 0.018f, 0.01f), glm::vec3(0.85f, 0.70f, 0.40f), glm::vec3(0.4f, 0.4f, 0.2f), 1.0f, 0.08f, 0.025f },
+        // 10: Lampadaire Motel Cour Centrale
+        { glm::vec3(110.0f, 4.2f,  -2.0f), glm::vec3(0.025f, 0.020f, 0.012f), glm::vec3(1.00f, 0.85f, 0.50f), glm::vec3(0.5f, 0.4f, 0.3f), 1.0f, 0.07f, 0.020f },
+        // 11: Neon Motel Enseigne & Reception (halo dore)
+        { glm::vec3(110.0f, 5.2f,  -8.0f), glm::vec3(0.03f, 0.022f, 0.01f), glm::vec3(1.20f, 0.90f, 0.45f), glm::vec3(0.6f, 0.5f, 0.3f), 1.0f, 0.07f, 0.020f },
+        // 12: Motel Aile Ouest / Galeries chambres
+        { glm::vec3( 96.0f, 3.8f, -14.0f), glm::vec3(0.02f, 0.015f, 0.01f), glm::vec3(0.80f, 0.65f, 0.40f), glm::vec3(0.4f, 0.3f, 0.2f), 1.0f, 0.08f, 0.025f },
+        // 13: Motel Aile Est / Galeries chambres
+        { glm::vec3(124.0f, 3.8f, -14.0f), glm::vec3(0.02f, 0.015f, 0.01f), glm::vec3(0.80f, 0.65f, 0.40f), glm::vec3(0.4f, 0.3f, 0.2f), 1.0f, 0.08f, 0.025f },
+        // 14: Motel Parking Asphalte Centre
+        { glm::vec3(110.0f, 3.8f,   4.0f), glm::vec3(0.02f, 0.018f, 0.015f), glm::vec3(0.75f, 0.70f, 0.60f), glm::vec3(0.4f, 0.4f, 0.3f), 1.0f, 0.08f, 0.025f },
+
+        // --- 15 a 22 : ROUTE PRINCIPALE (Piscines de lumiere tamisees sous les lampadaires) ---
+        // 15: Route Ouest -180m
+        { glm::vec3(-180.0f, 4.2f, 23.5f), glm::vec3(0.015f, 0.015f, 0.02f), glm::vec3(0.80f, 0.82f, 0.90f), glm::vec3(0.4f, 0.4f, 0.5f), 1.0f, 0.08f, 0.025f },
+        // 16: Route Ouest -120m
+        { glm::vec3(-120.0f, 4.2f, 23.5f), glm::vec3(0.015f, 0.015f, 0.02f), glm::vec3(0.80f, 0.82f, 0.90f), glm::vec3(0.4f, 0.4f, 0.5f), 1.0f, 0.08f, 0.025f },
+        // 17: Route Ouest -60m
+        { glm::vec3( -60.0f, 4.2f, 23.5f), glm::vec3(0.015f, 0.015f, 0.02f), glm::vec3(0.80f, 0.82f, 0.90f), glm::vec3(0.4f, 0.4f, 0.5f), 1.0f, 0.08f, 0.025f },
+        // 18: Route Devant Station -20m
+        { glm::vec3( -20.0f, 4.2f, 23.5f), glm::vec3(0.015f, 0.015f, 0.02f), glm::vec3(0.80f, 0.82f, 0.90f), glm::vec3(0.4f, 0.4f, 0.5f), 1.0f, 0.08f, 0.025f },
+        // 19: Route Centre +20m
+        { glm::vec3(  20.0f, 4.2f, 23.5f), glm::vec3(0.015f, 0.015f, 0.02f), glm::vec3(0.80f, 0.82f, 0.90f), glm::vec3(0.4f, 0.4f, 0.5f), 1.0f, 0.08f, 0.025f },
+        // 20: Route Devant Motel +60m
+        { glm::vec3(  60.0f, 4.2f, 23.5f), glm::vec3(0.015f, 0.015f, 0.02f), glm::vec3(0.80f, 0.82f, 0.90f), glm::vec3(0.4f, 0.4f, 0.5f), 1.0f, 0.08f, 0.025f },
+        // 21: Route Motel Entree +100m
+        { glm::vec3( 100.0f, 4.2f, 23.5f), glm::vec3(0.015f, 0.015f, 0.02f), glm::vec3(0.80f, 0.82f, 0.90f), glm::vec3(0.4f, 0.4f, 0.5f), 1.0f, 0.08f, 0.025f },
+        // 22: Route Est +160m
+        { glm::vec3( 160.0f, 4.2f, 23.5f), glm::vec3(0.015f, 0.015f, 0.02f), glm::vec3(0.80f, 0.82f, 0.90f), glm::vec3(0.4f, 0.4f, 0.5f), 1.0f, 0.08f, 0.025f },
+
+        // --- 23 : FEU DE CAMP (Feu de camp doux et chaleureux) ---
+        { glm::vec3(-35.0f, 0.70f, 46.0f), glm::vec3(0.03f, 0.015f, 0.005f), glm::vec3(1.50f, 0.70f, 0.15f), glm::vec3(0.8f, 0.4f, 0.1f), 1.0f, 0.09f, 0.035f },
+
+        // --- 24 : SLENDER MAN - Lueur spectrale tres subtile et lugubre ---
+        { glm::vec3(-34.0f, 2.8f, 61.2f), glm::vec3(0.003f, 0.005f, 0.006f), glm::vec3(0.09f, 0.12f, 0.15f), glm::vec3(0.04f, 0.05f, 0.07f), 1.0f, 0.16f, 0.06f },
+
+        // --- 25 : ENSEIGNE MOTEL ROUTE 66 - Projecteur chaud au-dessus du panneau ---
+        { SIGN_LIGHT_POS, glm::vec3(0.025f, 0.022f, 0.015f), glm::vec3(1.25f, 1.10f, 0.85f), glm::vec3(0.60f, 0.55f, 0.45f), 1.0f, 0.055f, 0.016f }
+    };
+
+    // Assemblage de toutes les ampoules physiques rayonnantes (tous les lampadaires du monde)
+    struct BulbItem {
+        glm::vec3 pos;
+        glm::vec3 col;
+        float sc;
+    };
+    std::vector<BulbItem> sceneBulbs;
+
+    // Ampoules station (5 lampadaires)
+    float stX[5] = { -24.0f, 24.0f, -24.0f, 24.0f, 0.0f };
+    float stZ[5] = {   8.0f,  8.0f, -30.0f, -30.0f, 8.0f };
+    for (int k = 0; k < 5; k++) {
+        sceneBulbs.push_back({ glm::vec3(stX[k], 4.05f, stZ[k]), glm::vec3(1.05f, 0.85f, 0.40f), 0.30f });
+    }
+    // Ampoules auvents pompes (2) et devanture (1)
+    sceneBulbs.push_back({ glm::vec3(-4.2f, 4.5f, -2.3f), glm::vec3(1.10f, 1.05f, 0.95f), 0.35f });
+    sceneBulbs.push_back({ glm::vec3( 3.4f, 4.5f, -2.3f), glm::vec3(1.10f, 1.05f, 0.95f), 0.35f });
+    sceneBulbs.push_back({ glm::vec3( 0.0f, 4.0f, -13.0f), glm::vec3(0.95f, 0.95f, 1.05f), 0.35f });
+
+    // Ampoules Route Sud (12 lampadaires)
+    for (float rx : roadLampsSouthX) {
+        sceneBulbs.push_back({ glm::vec3(rx, 4.05f, 23.5f), glm::vec3(0.90f, 0.95f, 1.05f), 0.30f });
+    }
+    // Ampoules Route Nord (8 lampadaires)
+    for (float rx : roadLampsNorthX) {
+        sceneBulbs.push_back({ glm::vec3(rx, 4.05f, 8.5f), glm::vec3(0.90f, 0.95f, 1.05f), 0.30f });
+    }
+
+    // Ampoules et eclairages Motel (3 lampadaires + neon reception + coursives)
+    sceneBulbs.push_back({ glm::vec3( 85.0f, 4.05f,   9.0f), glm::vec3(1.05f, 0.88f, 0.50f), 0.30f });
+    sceneBulbs.push_back({ glm::vec3(135.0f, 4.05f,   9.0f), glm::vec3(1.05f, 0.88f, 0.50f), 0.30f });
+    sceneBulbs.push_back({ glm::vec3(110.0f, 4.05f,  -2.0f), glm::vec3(1.10f, 0.90f, 0.55f), 0.30f });
+    sceneBulbs.push_back({ glm::vec3(110.0f, 5.2f,  -8.0f),  glm::vec3(1.20f, 0.90f, 0.40f), 0.45f });
+    sceneBulbs.push_back({ glm::vec3( 96.0f, 3.8f, -14.0f),  glm::vec3(1.00f, 0.80f, 0.45f), 0.28f });
+    sceneBulbs.push_back({ glm::vec3(124.0f, 3.8f, -14.0f),  glm::vec3(1.00f, 0.80f, 0.45f), 0.28f });
+
+    // Projecteur de l'enseigne Motel Route 66 (au sommet du panneau, 7 m)
+    sceneBulbs.push_back({ SIGN_LIGHT_POS, glm::vec3(1.20f, 1.05f, 0.75f), 0.40f });
+
+    double lastTime = glfwGetTime();
+
+    while (!glfwWindowShouldClose(gWindow))
+    {
+        showFPS(gWindow);
+        double cur  = glfwGetTime();
+        double dt   = cur - lastTime;
+        lastTime    = cur;
+        glfwPollEvents();
+        update(dt);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        glm::mat4 view(1.0f);
+        glm::vec3 camPos;
+        glm::vec3 camDir(0.0f, 0.0f, -1.0f);
+        if (gCinematicCamera) {
+            // -------------------------------------------------------------
+            // CAMERA CINEMA : plan fluide (splines de Catmull-Rom) sur le
+            // trajet gCamTour - aucun tremblement, regard toujours lisse
+            // -------------------------------------------------------------
+            const int   N     = gNumCamTour;
+            const float TOTAL = gCamTour[N - 1].t;
+
+            // Temps de visite : accumulateur (H = x1 / x3) -> pas de saut en changeant de vitesse
+            static double cineTime = 0.0;
+            cineTime += dt * (double)gCineSpeed;
+            float tt = fmodf((float)cineTime, TOTAL);
+
+            // Fin de tour : les voitures repartent de leur position de depart
+            static float lastTourTt = 0.0f;
+            if (tt < lastTourTt) {
+                for (int c = 0; c < NUM_ROAD_CARS; c++)
+                    gRoadCars[c].x = gRoadCars[c].x0;
+            }
+            lastTourTt = tt;
+
+            int i = 0;
+            while (i < N - 2 && tt >= gCamTour[i + 1].t) i++;
+            float u = (tt - gCamTour[i].t) / (gCamTour[i + 1].t - gCamTour[i].t);
+
+            auto catmull = [](const glm::vec3& p0, const glm::vec3& p1,
+                              const glm::vec3& p2, const glm::vec3& p3, float t) {
+                float t2 = t * t;
+                float t3 = t2 * t;
+                return 0.5f * (2.0f * p1 + (-p0 + p2) * t +
+                               (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
+                               (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+            };
+
+            const CamShot& s0 = gCamTour[i > 0     ? i - 1 : 0];
+            const CamShot& s1 = gCamTour[i];
+            const CamShot& s2 = gCamTour[i + 1];
+            const CamShot& s3 = gCamTour[i + 2 < N ? i + 2 : N - 1];
+
+            camPos = catmull(s0.pos, s1.pos, s2.pos, s3.pos, u);
+            glm::vec3 target = catmull(s0.look, s1.look, s2.look, s3.look, u);
+
+            camDir = target - camPos;
+            camDir = (glm::length(camDir) > 0.001f) ? glm::normalize(camDir)
+                                                    : glm::vec3(0.0f, 0.0f, -1.0f);
+            view = glm::lookAt(camPos, camPos + camDir, glm::vec3(0.0f, 1.0f, 0.0f));
+        } else {
+            view = fpsCamera.getViewMatrix();
+            camPos = fpsCamera.getPosition();
+            camDir = fpsCamera.getLook();
+        }
+
+        glm::mat4 proj = glm::perspective(glm::radians(fpsCamera.getFOV()),
+                                          (float)gWindowWidth/(float)gWindowHeight,
+                                          0.1f, 1500.0f);
+
+        lightingShader.use();
+        lightingShader.setUniform("view",       view);
+        lightingShader.setUniform("projection", proj);
+        lightingShader.setUniform("viewPos",    camPos);
+
+        // 1. DIRECTIONNELLE - Lune (nuit) ou Soleil (jour)
+        glm::vec3 moonSkyPos = gDayMode ? glm::vec3(90.0f, 150.0f, 70.0f)    // soleil d'apres-midi
+                                        : glm::vec3(-80.0f, 230.0f, -240.0f); // lune
+        lightingShader.setUniform("sunLight.direction", glm::normalize(glm::vec3(0.0f, 0.0f, 0.0f) - moonSkyPos));
+        if (gDayMode) {
+            lightingShader.setUniform("sunLight.ambient",   glm::vec3(0.55f, 0.58f, 0.62f));
+            lightingShader.setUniform("sunLight.diffuse",   glm::vec3(0.95f, 0.90f, 0.78f));
+            lightingShader.setUniform("sunLight.specular",  glm::vec3(0.35f, 0.35f, 0.32f));
+        } else {
+            lightingShader.setUniform("sunLight.ambient",   glm::vec3(0.12f, 0.14f, 0.18f));
+            lightingShader.setUniform("sunLight.diffuse",   glm::vec3(0.25f, 0.28f, 0.36f));
+            lightingShader.setUniform("sunLight.specular",  glm::vec3(0.12f, 0.14f, 0.18f));
+        }
+
+        // 2. ENVOI DES 26 POINT LIGHTS AU SHADER (eteintes de jour)
+        float todLight = gDayMode ? 0.0f : 1.0f;
+        float fireFlicker = 0.85f + 0.15f * sinf((float)cur * 14.0f) + 0.08f * sinf((float)cur * 27.0f);
+        for (int i = 0; i < NUM_POINT_LIGHTS; i++) {
+            std::string p = "pointLights[" + std::to_string(i) + "].";
+            lightingShader.setUniform((p + "position").c_str(), pointLights[i].position);
+            glm::vec3 amb = pointLights[i].ambient;
+            glm::vec3 dif = pointLights[i].diffuse;
+            glm::vec3 spc = pointLights[i].specular;
+            if (i == 23) { // Feu de camp
+                amb *= fireFlicker;
+                dif *= fireFlicker;
+                spc *= fireFlicker;
+            }
+            amb *= todLight; // lampadaires/neons : OFF de jour
+            dif *= todLight;
+            spc *= todLight;
+            lightingShader.setUniform((p + "ambient").c_str(),   amb);
+            lightingShader.setUniform((p + "diffuse").c_str(),   dif);
+            lightingShader.setUniform((p + "specular").c_str(),  spc);
+            lightingShader.setUniform((p + "constant").c_str(),  pointLights[i].constant);
+            lightingShader.setUniform((p + "linear").c_str(),    pointLights[i].linear);
+            lightingShader.setUniform((p + "exponent").c_str(),  pointLights[i].exponent);
+        }
+
+        // Animation des BMW en circulation (boucle d'un bout a l'autre de la route)
+        for (int c = 0; c < NUM_ROAD_CARS; c++) {
+            RoadCar& rc = gRoadCars[c];
+            if (rc.objIndex < 0) continue;
+            rc.x += ROAD_CAR_SPEED * rc.dir * (float)dt;
+            if (rc.dir < 0.0f && rc.x < -180.0f) rc.x =  180.0f; // respawn au bout de la route
+            if (rc.dir > 0.0f && rc.x >  180.0f) rc.x = -180.0f;
+            gSceneObjects[rc.objIndex].position.x = rc.x;
+        }
+
+        // 3. SPOTLIGHT - Torche camera (F)
+        glm::vec3 spotPos = camPos; spotPos.y -= 0.3f;
+        lightingShader.setUniform("spotLight.position",     spotPos);
+        lightingShader.setUniform("spotLight.direction",    camDir);
+        lightingShader.setUniform("spotLight.ambient",      glm::vec3(0.08f,0.08f,0.08f));
+        lightingShader.setUniform("spotLight.diffuse",      glm::vec3(1.40f,1.38f,1.35f));
+        lightingShader.setUniform("spotLight.specular",     glm::vec3(1.20f,1.20f,1.20f));
+        lightingShader.setUniform("spotLight.cosInnerCone", glm::cos(glm::radians(12.5f)));
+        lightingShader.setUniform("spotLight.cosOuterCone", glm::cos(glm::radians(20.0f)));
+        lightingShader.setUniform("spotLight.constant",     1.0f);
+        lightingShader.setUniform("spotLight.linear",       0.045f);
+        lightingShader.setUniform("spotLight.exponent",     0.0075f);
+        lightingShader.setUniform("spotLight.on",           (gFlashlightOn && !gDayMode) ? 1 : 0);
+
+        // 4. PHARES - 2 spots froids par voiture en circulation (8 projecteurs)
+        for (int c = 0; c < NUM_ROAD_CARS; c++) {
+            const RoadCar& rc = gRoadCars[c];
+            for (int h = 0; h < 2; h++) {
+                float lateral = ((h == 0) ? 0.72f : -0.72f) * (-rc.dir);
+                std::string hp = "headlights[" + std::to_string(c * 2 + h) + "].";
+                lightingShader.setUniform((hp + "position").c_str(),
+                    glm::vec3(rc.x + rc.dir * 2.35f, carY + 0.65f, rc.z + lateral));
+                lightingShader.setUniform((hp + "direction").c_str(),
+                    glm::normalize(glm::vec3(rc.dir, -0.09f, 0.0f)));
+                lightingShader.setUniform((hp + "cosInnerCone").c_str(), (float)cos(glm::radians(14.0)));
+                lightingShader.setUniform((hp + "cosOuterCone").c_str(), (float)cos(glm::radians(24.0)));
+                lightingShader.setUniform((hp + "ambient").c_str(),  glm::vec3(0.010f, 0.012f, 0.016f));
+                lightingShader.setUniform((hp + "diffuse").c_str(),  glm::vec3(1.25f, 1.28f, 1.35f));
+                lightingShader.setUniform((hp + "specular").c_str(), glm::vec3(0.85f, 0.88f, 0.95f));
+                lightingShader.setUniform((hp + "on").c_str(),       gDayMode ? 0 : 1);
+                lightingShader.setUniform((hp + "constant").c_str(), 1.0f);
+                lightingShader.setUniform((hp + "linear").c_str(),   0.035f);
+                lightingShader.setUniform((hp + "exponent").c_str(), 0.0055f);
+            }
+        }
+
+        // Animation des flammes du feu de camp
+        if (gCampfireFlamesIndex >= 0 && gCampfireFlamesIndex < gNumSceneObjects) {
+            float firePulseY  = 1.1f * (1.0f + 0.12f * sinf((float)cur * 14.0f) + 0.06f * cosf((float)cur * 23.0f));
+            float firePulseXZ = 1.1f * (1.0f + 0.05f * sinf((float)cur * 11.0f));
+            gSceneObjects[gCampfireFlamesIndex].scale = glm::vec3(firePulseXZ, firePulseY, firePulseXZ);
+        }
+
+        // DESSIN DES OBJETS
+        for (int i = 0; i < gNumSceneObjects; i++) {
+            if (!gSceneObjects[i].isLoaded) continue;
+            if (gDayMode && i == gMoonIndex) continue; // pas de lune le jour
+            glm::mat4 mdl(1.0f);
+            mdl = glm::translate(mdl, gSceneObjects[i].position);
+            if (gSceneObjects[i].rotationAngleDeg != 0.0f)
+                mdl = glm::rotate(mdl, glm::radians(gSceneObjects[i].rotationAngleDeg),
+                                  gSceneObjects[i].rotationAxis);
+            mdl = glm::scale(mdl, gSceneObjects[i].scale);
+            lightingShader.setUniform("model", mdl);
+            lightingShader.setUniform("alphaTest", gSceneObjects[i].alphaTest);
+            lightingShader.setUniform("isEmissive", gSceneObjects[i].isEmissive);
+            lightingShader.setUniform("material.ambient",  glm::vec3(0.18f,0.18f,0.18f));
+            lightingShader.setUniformSampler("material.diffuseMap", 0);
+            lightingShader.setUniform("material.specular", glm::vec3(0.50f,0.50f,0.50f));
+            lightingShader.setUniform("material.shininess", 64.0f);
+            if (gSceneObjects[i].pTexture) gSceneObjects[i].pTexture->bind(0);
+            if (gSceneObjects[i].pMesh)    gSceneObjects[i].pMesh->draw();
+            if (gSceneObjects[i].pTexture) gSceneObjects[i].pTexture->unbind(0);
+        }
+
+        // BULBES RAYONNANTS (Tous les lampadaires, enseignes, auvents et feu)
+        // Eteints de jour : pas de halo sur les lampadaires ni sur les phares
+        if (!gDayMode) {
+        bulbShader.use();
+        bulbShader.setUniform("view",       view);
+        bulbShader.setUniform("projection", proj);
+        float fireFlickerBulb = 0.85f + 0.15f * sinf((float)cur * 14.0f) + 0.08f * sinf((float)cur * 27.0f);
+
+        for (const auto& b : sceneBulbs) {
+            glm::mat4 bm = glm::translate(glm::mat4(1.0f), b.pos);
+            bm = glm::scale(bm, glm::vec3(b.sc));
+            bulbShader.setUniform("model",      bm);
+            bulbShader.setUniform("lightColor", b.col);
+            bulbMesh.draw();
+        }
+
+        // Bulbes specifiques au feu de camp (avec scintillement de couleur vive)
+        {
+            glm::mat4 bm = glm::translate(glm::mat4(1.0f), glm::vec3(-35.0f, 0.70f, 46.0f));
+            bm = glm::scale(bm, glm::vec3(0.65f));
+            bulbShader.setUniform("model",      bm);
+            bulbShader.setUniform("lightColor", glm::vec3(fireFlickerBulb * 1.50f, fireFlickerBulb * 0.65f, 0.12f));
+            bulbMesh.draw();
+        }
+
+        // Bulbes des BMW en circulation : 2 phares blancs + 2 feux arriere rouges
+        for (int c = 0; c < NUM_ROAD_CARS; c++) {
+            const RoadCar& rc = gRoadCars[c];
+            float side = -rc.dir; // lateral monde du cote +X local du modele
+            struct CarGlow { glm::vec3 pos; glm::vec3 col; float sc; };
+            CarGlow glows[4] = {
+                { glm::vec3(rc.x + rc.dir * 2.30f, carY + 0.65f, rc.z + 0.72f * side), glm::vec3(1.35f, 1.35f, 1.25f), 0.16f },
+                { glm::vec3(rc.x + rc.dir * 2.30f, carY + 0.65f, rc.z - 0.72f * side), glm::vec3(1.35f, 1.35f, 1.25f), 0.16f },
+                { glm::vec3(rc.x - rc.dir * 2.30f, carY + 0.68f, rc.z + 0.72f * side), glm::vec3(1.60f, 0.14f, 0.08f), 0.13f },
+                { glm::vec3(rc.x - rc.dir * 2.30f, carY + 0.68f, rc.z - 0.72f * side), glm::vec3(1.60f, 0.14f, 0.08f), 0.13f },
+            };
+            for (const auto& g : glows) {
+                glm::mat4 bm = glm::translate(glm::mat4(1.0f), g.pos);
+                bm = glm::scale(bm, glm::vec3(g.sc));
+                bulbShader.setUniform("model",      bm);
+                bulbShader.setUniform("lightColor", g.col);
+                bulbMesh.draw();
+            }
+        }
+        } // fin bulb (nuit uniquement)
+        glfwSwapBuffers(gWindow);
+    }
+    glfwTerminate();
+    return 0;
+}
+
+bool initOpenGL()
+{
+    if (!glfwInit()) return false;
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE,        GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+    gWindow = glfwCreateWindow(gWindowWidth, gWindowHeight, APP_TITLE, NULL, NULL);
+    if (!gWindow) { glfwTerminate(); return false; }
+    glfwMakeContextCurrent(gWindow);
+    glewExperimental = GL_TRUE;
+    if (glewInit() != GLEW_OK) return false;
+    glfwSetKeyCallback(gWindow, glfw_onKey);
+    glfwSetFramebufferSizeCallback(gWindow, glfw_onFramebufferSize);
+    glfwSetScrollCallback(gWindow, glfw_onMouseScroll);
+    glfwSetInputMode(gWindow, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    glfwSetCursorPos(gWindow, gWindowWidth/2.0, gWindowHeight/2.0);
+    glClearColor(gClearColor.r, gClearColor.g, gClearColor.b, gClearColor.a);
+    int w, h; glfwGetFramebufferSize(gWindow, &w, &h);
+    glViewport(0,0,w,h);
+    glEnable(GL_DEPTH_TEST);
+    return true;
+}
+
+void glfw_onKey(GLFWwindow* window, int key, int sc, int action, int mode) {
+    if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
+        glfwSetWindowShouldClose(window, GL_TRUE);
+    if (key == GLFW_KEY_E && action == GLFW_PRESS) {
+        gWireframe = !gWireframe;
+        glPolygonMode(GL_FRONT_AND_BACK, gWireframe ? GL_LINE : GL_FILL);
+    }
+    if (key == GLFW_KEY_F && action == GLFW_PRESS) {
+        gFlashlightOn = !gFlashlightOn;
+        std::cout << "[Spotlight] " << (gFlashlightOn ? "ON" : "OFF") << std::endl;
+    }
+    if (key == GLFW_KEY_C && action == GLFW_PRESS) {
+        gCinematicCamera = !gCinematicCamera;
+        std::cout << "[Camera Cin.] " << (gCinematicCamera ? "ON" : "OFF") << std::endl;
+    }
+    if (key == GLFW_KEY_N && action == GLFW_PRESS) {
+        gDayMode = !gDayMode;
+        gClearColor = gDayMode ? CLEAR_DAY : CLEAR_NIGHT;
+        glClearColor(gClearColor.r, gClearColor.g, gClearColor.b, gClearColor.a);
+        std::cout << "[Jour/Nuit] " << (gDayMode ? "JOUR" : "NUIT") << std::endl;
+    }
+    if (key == GLFW_KEY_H && action == GLFW_PRESS) {
+        gCineSpeed = (gCineSpeed > 1.5f) ? 1.0f : 3.0f;
+        std::cout << "[Vitesse camera] x" << gCineSpeed << std::endl;
+    }
+    if (key == GLFW_KEY_F11 && action == GLFW_PRESS) {
+        gFullscreen = !gFullscreen;
+        if (gFullscreen) {
+            // Fenetre maximisee (et non plein ecran exclusif) pour rester
+            // fluide et compatible avec les captures d'ecran (OBS, Win+G...)
+            glfwGetWindowSize(gWindow, &gWindowedW, &gWindowedH);
+            glfwGetWindowPos(gWindow, &gWindowedX, &gWindowedY);
+            glfwMaximizeWindow(gWindow);
+        } else {
+            glfwRestoreWindow(gWindow);
+            glfwSetWindowPos(gWindow, gWindowedX, gWindowedY);
+            glfwSetWindowSize(gWindow, gWindowedW, gWindowedH);
+        }
+        std::cout << "[Plein ecran] " << (gFullscreen ? "ON" : "OFF") << std::endl;
+    }
+}
+void glfw_onFramebufferSize(GLFWwindow* w, int width, int height) {
+    gWindowWidth = width; gWindowHeight = height;
+    int fw, fh; glfwGetFramebufferSize(gWindow, &fw, &fh);
+    glViewport(0,0,fw,fh);
+}
+void glfw_onMouseScroll(GLFWwindow* w, double dx, double dy) {
+    double fov = fpsCamera.getFOV() + dy * ZOOM_SENSITIVITY;
+    fov = glm::clamp(fov, 1.0, 120.0);
+    fpsCamera.setFOV((float)fov);
+}
+void update(double dt) {
+    if (gCinematicCamera) return;
+    double mx, my;
+    glfwGetCursorPos(gWindow, &mx, &my);
+    fpsCamera.rotate((float)(gWindowWidth/2.0-mx)*MOUSE_SENSITIVITY,
+                     (float)(gWindowHeight/2.0-my)*MOUSE_SENSITIVITY);
+    glfwSetCursorPos(gWindow, gWindowWidth/2.0, gWindowHeight/2.0);
+
+    float speed = MOVE_SPEED;
+    if (glfwGetKey(gWindow, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+        glfwGetKey(gWindow, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS) {
+        speed *= 2.2f; // Sprint turbo (61 m/s)
+    }
+
+    if (glfwGetKey(gWindow,GLFW_KEY_W)==GLFW_PRESS)
+        fpsCamera.move( speed*(float)dt*fpsCamera.getLook());
+    else if (glfwGetKey(gWindow,GLFW_KEY_S)==GLFW_PRESS)
+        fpsCamera.move(-speed*(float)dt*fpsCamera.getLook());
+    if (glfwGetKey(gWindow,GLFW_KEY_A)==GLFW_PRESS)
+        fpsCamera.move(-speed*(float)dt*fpsCamera.getRight());
+    else if (glfwGetKey(gWindow,GLFW_KEY_D)==GLFW_PRESS)
+        fpsCamera.move( speed*(float)dt*fpsCamera.getRight());
+    if (glfwGetKey(gWindow,GLFW_KEY_Z)==GLFW_PRESS)
+        fpsCamera.move( speed*(float)dt*glm::vec3(0,1,0));
+    else if (glfwGetKey(gWindow,GLFW_KEY_X)==GLFW_PRESS)
+        fpsCamera.move(-speed*(float)dt*glm::vec3(0,1,0));
+}
+void showFPS(GLFWwindow* window) {
+    static double prev=0.0; static int frames=0;
+    double cur=glfwGetTime(), el=cur-prev;
+    if (el>0.25) {
+        prev=cur; double fps=frames/el;
+        std::ostringstream o; o.precision(2);
+        o << std::fixed << APP_TITLE << "  |  FPS: " << fps
+          << "  |  [F]Torche [E]Wire [C]Cinema [N]" << (gDayMode ? "Jour" : "Nuit");
+        glfwSetWindowTitle(window, o.str().c_str());
+        frames=0;
+    }
+    frames++;
+}

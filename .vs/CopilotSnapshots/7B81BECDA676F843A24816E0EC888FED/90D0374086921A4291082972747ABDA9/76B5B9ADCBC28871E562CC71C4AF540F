@@ -1,0 +1,24 @@
+﻿# Randomize main.cpp code-line indentation only. Comments/#preprocessor untouched.
+$lines = Get-Content main.cpp
+$rng = New-Object System.Random(987654)
+$out = New-Object System.Collections.Generic.List[string]
+foreach ($ln in $lines) {
+	$trim = $ln.TrimStart()
+	if ($trim.Length -eq 0) { $out.Add(""); continue }
+	if ($trim.StartsWith("//") -or $trim.StartsWith("/*") -or $trim.StartsWith("*") -or $trim.StartsWith("#")) {
+		$out.Add($ln); continue
+	}
+	$r = $rng.Next(100)
+	if ($r -lt 55) {
+		$indent = " " * $rng.Next(0, 13)           # 0-12 spaces
+	} elseif ($r -lt 78) {
+		$indent = "`t" + (" " * $rng.Next(0, 5))   # tab + 0-4 spaces
+	} elseif ($r -lt 92) {
+		$indent = ("`t" * 2) + (" " * $rng.Next(0, 4))
+	} else {
+		$indent = " " * $rng.Next(3, 9) + "`t"     # spaces then tab (ugly)
+	}
+	$out.Add($indent + $trim)
+}
+[System.IO.File]::WriteAllLines("$PWD\main.cpp", $out)
+Write-Host "done main.cpp"

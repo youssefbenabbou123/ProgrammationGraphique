@@ -1,0 +1,14 @@
+{
+    "version": 1,
+    "revision": 0,
+    "rules": [
+        {
+            "primary-output": "ProjetYoussef\\x64\\Debug\\Camera.obj",
+            "outputs": [
+                "ProjetYoussef\\x64\\Debug\\Camera.cpp.obj.dt.module.json",
+                "ProjetYoussef\\x64\\Debug\\Camera.cpp.obj.dt.d.json"
+            ],
+            "requires": []
+        }
+    ]
+}

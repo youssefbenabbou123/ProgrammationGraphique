@@ -1,0 +1,3 @@
+newmtl car_merc_g
+Kd 1 1 1
+map_Kd ../textures/car_merc_g.png

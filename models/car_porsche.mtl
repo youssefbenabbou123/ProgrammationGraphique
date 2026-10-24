@@ -1,0 +1,3 @@
+newmtl car_porsche
+Kd 1 1 1
+map_Kd ../textures/car_porsche.png

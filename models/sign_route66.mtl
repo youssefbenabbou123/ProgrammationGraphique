@@ -1,0 +1,3 @@
+newmtl sign_route66
+Kd 1 1 1
+map_Kd ../textures/sign_route66.png

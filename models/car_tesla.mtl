@@ -1,0 +1,3 @@
+newmtl car_tesla
+Kd 1 1 1
+map_Kd ../textures/car_tesla.png
